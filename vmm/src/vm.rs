@@ -926,6 +926,28 @@ impl Vm {
         Ok(EntryPoint { entry_addr })
     }
 
+    fn load_elf(mut kernel: File, memory_manager: Arc<Mutex<MemoryManager>>) -> Result<()> {
+        info!("Loading elf");
+
+        let mem = {
+            let guest_memory = memory_manager.lock().as_ref().unwrap().guest_memory();
+            guest_memory.memory()
+        };
+
+        let load_result = linux_loader::loader::elf::Elf::load(
+            mem.deref(),
+            None,
+            &mut kernel,
+            Some(arch::layout::HIGH_RAM_START),
+        )
+        .map_err(Error::KernelLoad)?;
+        info!(
+            "ELF loaded: 0x{:x} - 0x{:x}",
+            load_result.kernel_load.0, load_result.kernel_end,
+        );
+        Ok(())
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn load_kernel(
         mut kernel: File,
@@ -938,7 +960,7 @@ impl Vm {
             let guest_memory = memory_manager.lock().as_ref().unwrap().guest_memory();
             guest_memory.memory()
         };
-        let entry_addr = linux_loader::loader::elf::Elf::load(
+        let load_result = linux_loader::loader::elf::Elf::load(
             mem.deref(),
             None,
             &mut kernel,
@@ -949,11 +971,12 @@ impl Vm {
         if let Some(cmdline) = cmdline {
             linux_loader::loader::load_cmdline(mem.deref(), arch::layout::CMDLINE_START, &cmdline)
                 .map_err(Error::LoadCmdLine)?;
+            info!("Cmdline: 0x{:x}", arch::layout::CMDLINE_START.0);
         }
 
-        if let PvhEntryPresent(entry_addr) = entry_addr.pvh_boot_cap {
+        if let PvhEntryPresent(entry_addr) = load_result.pvh_boot_cap {
             // Use the PVH kernel entry point to boot the guest
-            info!("Kernel loaded: entry_addr = 0x{:x}", entry_addr.0);
+            info!("Kernel loaded: 0x{:x} - 0x{:x}, entry_addr = 0x{:x}", load_result.kernel_load.0, load_result.kernel_end, entry_addr.0);
             Ok(EntryPoint {
                 entry_addr: Some(entry_addr),
             })
@@ -982,6 +1005,13 @@ impl Vm {
                 let kernel = File::open(kernel).map_err(Error::KernelFile)?;
                 let cmdline = Self::generate_cmdline(payload)?;
                 Self::load_kernel(kernel, Some(cmdline), memory_manager)
+            }
+            (Some(firmware), Some(kernel), _, _) => {
+                let kernel = File::open(kernel).map_err(Error::KernelFile)?;
+                let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
+                let cmdline = Self::generate_cmdline(payload)?;
+                Self::load_elf(kernel, memory_manager.clone())?;
+                Self::load_kernel(firmware, Some(cmdline), memory_manager)
             }
             _ => Err(Error::InvalidPayload),
         }
