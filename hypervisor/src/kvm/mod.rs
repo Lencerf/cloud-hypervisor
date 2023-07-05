@@ -315,6 +315,8 @@ pub struct KvmVm {
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     dirty_log_slots: Arc<RwLock<HashMap<u32, KvmDirtyLogSlot>>>,
+    #[cfg(feature = "sev")]
+    sev: Option<Sev>,
 }
 
 impl KvmVm {
@@ -332,6 +334,32 @@ impl KvmVm {
     /// Checks if a particular `Cap` is available.
     pub fn check_extension(&self, c: Cap) -> bool {
         self.fd.check_extension(c)
+    }
+
+    #[cfg(feature = "sev")]
+    fn sev_command<D>(&self, id: u32, data: Option<&mut D>) -> vm::Result<()> {
+        let Some(ref sev) = self.sev else {
+            return Err(crate::HypervisorVmError::Sev(anyhow!("Sev not enabled").into()));
+        };
+        let mut cmd = kvm_bindings::kvm_sev_cmd {
+            id,
+            data: if let Some(data) = data {
+                data as *mut _ as _
+            } else {
+                0
+            },
+            error: 0,
+            sev_fd: sev.as_raw_fd() as _,
+        };
+        let ret = self.fd.encrypt_op_sev(&mut cmd);
+        if ret.is_err() {
+            return Err(crate::HypervisorVmError::Sev(anyhow!("ioctl error")));
+        }
+        if cmd.error != 0 {
+            Err(crate::HypervisorVmError::Sev(anyhow!("sev error")))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -830,6 +858,37 @@ impl vm::Vm for KvmVm {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    #[cfg(feature = "sev")]
+    fn sev_init(&self) -> vm::Result<()> {
+        self.sev_command::<u8>(kvm_bindings::sev_cmd_id_KVM_SEV_INIT, None)
+    }
+
+    #[cfg(feature = "sev")]
+    fn sev_launch_start(
+        &self,
+        handle: u32,
+        policy: u32,
+        dh: &[u8],
+        session: &[u8],
+    ) -> vm::Result<()> {
+        let mut data = kvm_bindings::kvm_sev_launch_start {
+            handle,
+            policy,
+            dh_len: dh.len() as _,
+            dh_uaddr: if dh.len() > 0 { dh.as_ptr() as _ } else { 0 },
+            session_len: session.len() as _,
+            session_uaddr: if session.len() > 0 {
+                session.as_ptr() as _
+            } else {
+                0
+            },
+        };
+        self.sev_command(
+            kvm_bindings::sev_cmd_id_KVM_SEV_LAUNCH_START,
+            Some(&mut data),
+        )
+    }
 }
 
 #[cfg(feature = "tdx")]
@@ -867,6 +926,35 @@ fn tdx_command(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(feature = "sev")]
+struct Sev {
+    sev: File,
+}
+
+#[cfg(feature = "sev")]
+impl Sev {
+    pub fn new() -> Result<Self, std::io::Error> {
+        let open_flags = libc::O_RDWR | libc::O_CLOEXEC;
+        let fd = unsafe { libc::open(b"/dev/sev\0" as *const u8 as *const _, open_flags) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                sev: unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) },
+            })
+        }
+    }
+
+    // pub fn init() -> Result<(), >
+}
+
+#[cfg(feature = "sev")]
+impl AsRawFd for Sev {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.sev.as_raw_fd()
+    }
 }
 
 /// Wrapper over KVM system ioctls.
@@ -945,7 +1033,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// let hypervisor = KvmHypervisor::new().unwrap();
     /// let vm = hypervisor.create_vm_with_type(0).unwrap();
     /// ```
-    fn create_vm_with_type(&self, vm_type: u64) -> hypervisor::Result<Arc<dyn vm::Vm>> {
+    fn create_vm_with_type(
+        &self,
+        vm_type: u64,
+        #[cfg(feature = "sev")] enable_sev: bool,
+    ) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         let fd: VmFd;
         loop {
             match self.kvm.create_vm_with_type(vm_type) {
@@ -981,10 +1073,19 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 msrs[pos].index = *index;
             }
 
+            #[cfg(feature = "sev")]
+            let sev = if enable_sev {
+                Some(Sev::new().map_err(|e| crate::HypervisorError::VmCreate(e.into()))?)
+            } else {
+                None
+            };
+
             Ok(Arc::new(KvmVm {
                 fd: vm_fd,
                 msrs,
                 dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+                #[cfg(feature = "sev")]
+                sev,
             }))
         }
 
@@ -1007,7 +1108,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// let hypervisor = KvmHypervisor::new().unwrap();
     /// let vm = hypervisor.create_vm().unwrap();
     /// ```
-    fn create_vm(&self) -> hypervisor::Result<Arc<dyn vm::Vm>> {
+    fn create_vm(
+        &self,
+        #[cfg(feature = "sev")] enable_sev: bool,
+    ) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         #[allow(unused_mut)]
         let mut vm_type: u64 = 0; // Create with default platform type
 
@@ -1019,7 +1123,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             vm_type = self.kvm.get_host_ipa_limit().try_into().unwrap();
         }
 
-        self.create_vm_with_type(vm_type)
+        self.create_vm_with_type(
+            vm_type,
+            #[cfg(feature = "sev")]
+            enable_sev,
+        )
     }
 
     fn check_required_extensions(&self) -> hypervisor::Result<()> {

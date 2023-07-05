@@ -760,6 +760,8 @@ impl Vm {
             &hypervisor,
             #[cfg(feature = "tdx")]
             tdx_enabled,
+            #[cfg(feature = "sev")]
+            false,
         )?;
 
         let phys_bits = physical_bits(&hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
@@ -818,6 +820,7 @@ impl Vm {
     pub fn create_hypervisor_vm(
         hypervisor: &Arc<dyn hypervisor::Hypervisor>,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "sev")] sev_enabled: bool,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
         hypervisor.check_required_extensions().unwrap();
 
@@ -825,10 +828,19 @@ impl Vm {
         // 1 for KVM_X86_TDX_VM
         #[cfg(feature = "tdx")]
         let vm = hypervisor
-            .create_vm_with_type(u64::from(tdx_enabled))
+            .create_vm_with_type(
+                u64::from(tdx_enabled),
+                #[cfg(feature = "sev")]
+                sev_enabled,
+            )
             .unwrap();
         #[cfg(not(feature = "tdx"))]
-        let vm = hypervisor.create_vm().unwrap();
+        let vm = hypervisor
+            .create_vm(
+                #[cfg(feature = "sev")]
+                sev_enabled,
+            )
+            .unwrap();
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -976,7 +988,10 @@ impl Vm {
 
         if let PvhEntryPresent(entry_addr) = load_result.pvh_boot_cap {
             // Use the PVH kernel entry point to boot the guest
-            info!("Kernel loaded: 0x{:x} - 0x{:x}, entry_addr = 0x{:x}", load_result.kernel_load.0, load_result.kernel_end, entry_addr.0);
+            info!(
+                "Kernel loaded: 0x{:x} - 0x{:x}, entry_addr = 0x{:x}",
+                load_result.kernel_load.0, load_result.kernel_end, entry_addr.0
+            );
             Ok(EntryPoint {
                 entry_addr: Some(entry_addr),
             })

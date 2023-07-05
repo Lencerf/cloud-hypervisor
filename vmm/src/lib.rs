@@ -1251,6 +1251,8 @@ impl Vmm {
             &self.hypervisor,
             #[cfg(feature = "tdx")]
             false,
+            #[cfg(feature = "sev")]
+            false,
         )
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!(

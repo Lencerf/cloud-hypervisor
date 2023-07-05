@@ -213,6 +213,12 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to create Vgic: {0}")]
     CreateVgic(#[source] anyhow::Error),
+    #[cfg(feature = "sev")]
+    ///
+    /// Failed to issue an SEV subcommand.
+    ///
+    #[error("Sev command:{0}")]
+    Sev(#[source] anyhow::Error),
 }
 ///
 /// Result type for returning from a function
@@ -345,6 +351,23 @@ pub trait Vm: Send + Sync + Any {
     ) -> Result<()> {
         unimplemented!()
     }
+
+    #[cfg(feature = "sev")]
+    fn sev_init(&self) -> Result<()> {
+        unreachable!()
+    }
+
+    #[cfg(feature = "sev")]
+    fn sev_launch_start(
+        &self,
+        _handle: u32,
+        _policy: u32,
+        _dh: &[u8],
+        _session: &[u8],
+    ) -> Result<()> {
+        unreachable!()
+    }
+
     /// Downcast to the underlying hypervisor VM type
     fn as_any(&self) -> &dyn Any;
 }
