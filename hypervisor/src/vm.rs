@@ -360,7 +360,6 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(feature = "sev")]
     fn sev_launch_start(
         &self,
-        _handle: u32,
         _policy: u32,
         _dh: &[u8],
         _session: &[u8],

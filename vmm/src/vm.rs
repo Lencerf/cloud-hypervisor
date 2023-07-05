@@ -857,6 +857,8 @@ impl Vm {
         if sev_enabled {
             vm.sev_init().map_err(Error::SevRelated)?;
             info!("sev initialzed");
+            vm.sev_launch_start(0x1, &[], &[]).map_err(Error::SevRelated)?;
+            info!("sev launch start")
         }
 
         #[cfg(target_arch = "x86_64")]

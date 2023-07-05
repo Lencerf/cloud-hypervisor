@@ -316,7 +316,7 @@ pub struct KvmVm {
     msrs: Vec<MsrEntry>,
     dirty_log_slots: Arc<RwLock<HashMap<u32, KvmDirtyLogSlot>>>,
     #[cfg(feature = "sev")]
-    sev: Option<Sev>,
+    sev: Option<Arc<RwLock<Sev>>>,
 }
 
 impl KvmVm {
@@ -341,6 +341,7 @@ impl KvmVm {
         let Some(ref sev) = self.sev else {
             return Err(crate::HypervisorVmError::Sev(anyhow!("Sev not enabled").into()));
         };
+        let sev = sev.read().unwrap();
         let mut cmd = kvm_bindings::kvm_sev_cmd {
             id,
             data: if let Some(data) = data {
@@ -867,13 +868,12 @@ impl vm::Vm for KvmVm {
     #[cfg(feature = "sev")]
     fn sev_launch_start(
         &self,
-        handle: u32,
         policy: u32,
         dh: &[u8],
         session: &[u8],
     ) -> vm::Result<()> {
         let mut data = kvm_bindings::kvm_sev_launch_start {
-            handle,
+            handle: 0,
             policy,
             dh_len: dh.len() as _,
             dh_uaddr: if dh.len() > 0 { dh.as_ptr() as _ } else { 0 },
@@ -887,7 +887,9 @@ impl vm::Vm for KvmVm {
         self.sev_command(
             kvm_bindings::sev_cmd_id_KVM_SEV_LAUNCH_START,
             Some(&mut data),
-        )
+        )?;
+        self.sev.as_ref().unwrap().write().unwrap().handle = data.handle;
+        Ok(())
     }
 }
 
@@ -931,6 +933,7 @@ fn tdx_command(
 #[cfg(feature = "sev")]
 struct Sev {
     sev: File,
+    handle: u32,
 }
 
 #[cfg(feature = "sev")]
@@ -943,6 +946,7 @@ impl Sev {
         } else {
             Ok(Self {
                 sev: unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) },
+                handle: 0,
             })
         }
     }
@@ -1075,7 +1079,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[cfg(feature = "sev")]
             let sev = if enable_sev {
-                Some(Sev::new().map_err(|e| crate::HypervisorError::VmCreate(e.into()))?)
+                let sev = Sev::new().map_err(|e| crate::HypervisorError::VmCreate(e.into()))?;
+                Some(Arc::new(RwLock::new(sev)))
             } else {
                 None
             };
