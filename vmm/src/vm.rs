@@ -282,6 +282,10 @@ pub enum Error {
     #[error("Invalid TDX payload type")]
     InvalidPayloadType,
 
+    #[cfg(feature = "sev")]
+    #[error("SEV: {0}")]
+    SevRelated(#[source] hypervisor::HypervisorVmError),
+
     #[cfg(feature = "guest_debug")]
     #[error("Error debugging VM: {0:?}")]
     Debug(DebuggableError),
@@ -756,12 +760,19 @@ impl Vm {
             vm_config.lock().unwrap().is_tdx_enabled()
         };
 
+        #[cfg(feature = "sev")]
+        let sev_enabled = if snapshot.is_some() {
+            false
+        } else {
+            vm_config.lock().unwrap().is_sev_enabled()
+        };
+
         let vm = Self::create_hypervisor_vm(
             &hypervisor,
             #[cfg(feature = "tdx")]
             tdx_enabled,
             #[cfg(feature = "sev")]
-            false,
+            sev_enabled,
         )?;
 
         let phys_bits = physical_bits(&hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
@@ -831,7 +842,7 @@ impl Vm {
             .create_vm_with_type(
                 u64::from(tdx_enabled),
                 #[cfg(feature = "sev")]
-                sev_enabled,
+                sev_enabled
             )
             .unwrap();
         #[cfg(not(feature = "tdx"))]
@@ -841,6 +852,12 @@ impl Vm {
                 sev_enabled,
             )
             .unwrap();
+    
+        #[cfg(feature = "sev")]
+        if sev_enabled {
+            vm.sev_init().map_err(Error::SevRelated)?;
+            info!("sev initialzed");
+        }
 
         #[cfg(target_arch = "x86_64")]
         {

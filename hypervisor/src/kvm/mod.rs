@@ -937,7 +937,7 @@ struct Sev {
 impl Sev {
     pub fn new() -> Result<Self, std::io::Error> {
         let open_flags = libc::O_RDWR | libc::O_CLOEXEC;
-        let fd = unsafe { libc::open(b"/dev/sev\0" as *const u8 as *const _, open_flags) };
+        let fd = unsafe { libc::open(b"/mnt/devtmpfs/sev\0" as *const u8 as *const _, open_flags) };
         if fd < 0 {
             Err(std::io::Error::last_os_error())
         } else {
