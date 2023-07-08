@@ -625,6 +625,7 @@ impl vm::Vm for KvmVm {
             region.flags = 0;
         }
 
+        info!("call kvm set_user_memory_region: {:x?}", region);
         // SAFETY: Safe because guest regions are guaranteed not to overlap.
         unsafe {
             self.fd
@@ -858,6 +859,18 @@ impl vm::Vm for KvmVm {
     /// Downcast to the underlying KvmVm type
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn register_enc_memory(&self, addr: *const u8, size: usize) -> vm::Result<()> {
+        let region = kvm_bindings::kvm_enc_region{
+            addr: addr as _,
+            size: size as _,
+        };
+        let ret = self.fd.register_enc_memory_region(&region);
+        if ret.is_err() {
+            return Err(crate::HypervisorVmError::Sev(anyhow!("register enc memory")));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "sev")]

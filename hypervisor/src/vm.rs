@@ -352,6 +352,10 @@ pub trait Vm: Send + Sync + Any {
         unimplemented!()
     }
 
+    fn register_enc_memory(&self, _addr: *const u8, _size: usize) -> Result<()> {
+        unimplemented!()
+    }
+
     #[cfg(feature = "sev")]
     fn sev_init(&self) -> Result<()> {
         unreachable!()

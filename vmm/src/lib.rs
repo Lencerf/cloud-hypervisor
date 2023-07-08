@@ -1271,6 +1271,8 @@ impl Vmm {
             phys_bits,
             #[cfg(feature = "tdx")]
             false,
+            #[cfg(feature = "sev")]
+            false,
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
             #[cfg(target_arch = "x86_64")]

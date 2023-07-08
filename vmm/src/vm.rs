@@ -515,6 +515,7 @@ impl Vm {
         });
 
         let cpus_config = { &config.lock().unwrap().cpus.clone() };
+        /* read cpu manager here  */
         let cpu_manager = cpu::CpuManager::new(
             cpus_config,
             vm.clone(),
@@ -800,6 +801,8 @@ impl Vm {
                 phys_bits,
                 #[cfg(feature = "tdx")]
                 tdx_enabled,
+                #[cfg(feature = "sev")]
+                sev_enabled,
                 None,
                 None,
                 #[cfg(target_arch = "x86_64")]
@@ -987,6 +990,8 @@ impl Vm {
     ) -> Result<EntryPoint> {
         info!("Loading kernel");
 
+        /* kernel/firmware loaded here */
+
         let mem = {
             let guest_memory = memory_manager.lock().as_ref().unwrap().guest_memory();
             guest_memory.memory()
@@ -998,6 +1003,8 @@ impl Vm {
             Some(arch::layout::HIGH_RAM_START),
         )
         .map_err(Error::KernelLoad)?;
+
+    /* command line loaded here */
 
         if let Some(cmdline) = cmdline {
             linux_loader::loader::load_cmdline(mem.deref(), arch::layout::CMDLINE_START, &cmdline)
@@ -1103,6 +1110,7 @@ impl Vm {
         let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
 
         let initramfs_config = match self.initramfs {
+            /* init ramfs loaded here */
             Some(_) => Some(self.load_initramfs(&mem)?),
             None => None,
         };

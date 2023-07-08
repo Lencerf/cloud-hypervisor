@@ -975,6 +975,7 @@ impl MemoryManager {
         prefault: Option<bool>,
         phys_bits: u8,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "sev")] sev_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: Option<HashMap<u32, File>>,
         #[cfg(target_arch = "x86_64")] sgx_epc_config: Option<Vec<SgxEpcConfig>>,
@@ -1052,6 +1053,20 @@ impl MemoryManager {
 
             let (mem_regions, mut memory_zones) =
                 Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp)?;
+
+            /* register here ? */
+            #[cfg(feature = "sev")]
+            if sev_enabled {
+                for region in &mem_regions {
+                    info!(
+                        "register enc addr = {:x}, size = {:x}",
+                        region.as_ptr() as usize,
+                        region.size()
+                    );
+                    vm.register_enc_memory(region.as_ptr(), region.size())
+                        .map_err(Error::CreateUserMemoryRegion)?;
+                }
+            }
 
             let mut guest_memory =
                 GuestMemoryMmap::from_arc_regions(mem_regions).map_err(Error::GuestMemory)?;
@@ -1270,6 +1285,8 @@ impl MemoryManager {
                 Some(prefault),
                 phys_bits,
                 #[cfg(feature = "tdx")]
+                false,
+                #[cfg(feature = "sev")]
                 false,
                 Some(&mem_snapshot),
                 None,
@@ -1652,6 +1669,8 @@ impl MemoryManager {
             "Creating userspace mapping: {:x} -> {:x} {:x}, slot {}",
             guest_phys_addr, userspace_addr, memory_size, slot
         );
+
+        /* another place to register enc */
 
         self.vm
             .create_user_memory_region(mem_region)
