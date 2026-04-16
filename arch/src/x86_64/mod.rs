@@ -957,7 +957,7 @@ pub fn configure_system(
     rsdp_addr: Option<GuestAddress>,
     serial_number: Option<&str>,
     uuid: Option<&str>,
-    oem_strings: Option<&[&str]>,
+    oem_strings: Option<&[String]>,
     topology: Option<(u16, u16, u16, u16)>,
 ) -> super::Result<()> {
     // Write EBDA address to location where ACPICA expects to find it

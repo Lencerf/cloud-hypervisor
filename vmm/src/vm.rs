@@ -18,6 +18,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
@@ -1358,8 +1359,8 @@ impl Vm {
         Ok(vm)
     }
 
-    fn load_initramfs(&mut self, guest_mem: &GuestMemoryMmap) -> Result<arch::InitramfsConfig> {
-        let initramfs = self.initramfs.as_mut().unwrap();
+    fn load_initramfs(&self, guest_mem: &GuestMemoryMmap) -> Result<arch::InitramfsConfig> {
+        let mut initramfs = self.initramfs.as_ref().unwrap();
         let size: usize = initramfs
             .seek(SeekFrom::End(0))
             .map_err(|_| Error::InitramfsLoad)?
@@ -1371,8 +1372,9 @@ impl Vm {
             arch::initramfs_load_addr(guest_mem, size).map_err(|_| Error::InitramfsLoad)?;
         let address = GuestAddress(address);
 
+        let mut initramfs_fd = initramfs.as_fd();
         guest_mem
-            .read_volatile_from(address, initramfs, size)
+            .read_volatile_from(address, &mut initramfs_fd, size)
             .map_err(|_| Error::InitramfsLoad)?;
 
         info!("Initramfs loaded: address = 0x{:x}", address.0);
@@ -1647,6 +1649,8 @@ impl Vm {
         trace_scoped!("configure_system");
         info!("Configuring system");
         let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
+        let config = self.config.lock().unwrap();
+        let platform = config.platform.as_ref();
 
         let initramfs_config = match self.initramfs {
             Some(_) => Some(self.load_initramfs(&mem)?),
@@ -1656,33 +1660,11 @@ impl Vm {
         let boot_vcpus = self.cpu_manager.lock().unwrap().boot_vcpus();
         let rsdp_addr = Some(rsdp_addr);
 
-        let serial_number = self
-            .config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .and_then(|p| p.serial_number.clone());
+        let serial_number = platform.and_then(|p| p.serial_number.as_deref());
 
-        let uuid = self
-            .config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .and_then(|p| p.uuid.clone());
+        let uuid = platform.and_then(|p| p.uuid.as_deref());
 
-        let oem_strings = self
-            .config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .and_then(|p| p.oem_strings.clone());
-
-        let oem_strings = oem_strings
-            .as_deref()
-            .map(|strings| strings.iter().map(|s| s.as_ref()).collect::<Vec<&str>>());
+        let oem_strings = platform.and_then(|p| p.oem_strings.as_deref());
 
         let topology = self.cpu_manager.lock().unwrap().get_vcpu_topology();
 
@@ -1694,9 +1676,9 @@ impl Vm {
             boot_vcpus,
             entry_addr.setup_header,
             rsdp_addr,
-            serial_number.as_deref(),
-            uuid.as_deref(),
-            oem_strings.as_deref(),
+            serial_number,
+            uuid,
+            oem_strings,
             topology,
         )
         .map_err(Error::ConfigureSystem)?;

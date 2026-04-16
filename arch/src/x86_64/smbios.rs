@@ -166,7 +166,7 @@ pub fn setup_smbios(
     mem: &GuestMemoryMmap,
     serial_number: Option<&str>,
     uuid: Option<&str>,
-    oem_strings: Option<&[&str]>,
+    oem_strings: Option<&[String]>,
 ) -> Result<u64> {
     let physptr = GuestAddress(SMBIOS_START)
         .checked_add(mem::size_of::<Smbios30Entrypoint>() as u64)
