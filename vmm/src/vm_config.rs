@@ -682,6 +682,10 @@ pub struct FsConfig {
     pub num_queues: u16,
     #[serde(default = "default_fsconfig_queue_size")]
     pub queue_size: u16,
+    #[serde(default = "default_fsconfig_dax")]
+    pub dax: bool,
+    #[serde(default = "default_fsconfig_cache_size")]
+    pub cache_size: u64,
 }
 
 pub fn default_fsconfig_num_queues() -> u16 {
@@ -690,6 +694,14 @@ pub fn default_fsconfig_num_queues() -> u16 {
 
 pub fn default_fsconfig_queue_size() -> u16 {
     1024
+}
+
+pub fn default_fsconfig_dax() -> bool {
+    false
+}
+
+pub fn default_fsconfig_cache_size() -> u64 {
+    1 << 28 // 256 MiB micro-VM friendly DAX window default
 }
 
 impl ApplyLandlock for FsConfig {

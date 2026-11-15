@@ -1465,6 +1465,13 @@ components:
           type: integer
           format: uint16
           default: 1
+        dax:
+          type: boolean
+          default: false
+        cache_size:
+          type: integer
+          format: uint64
+          default: 268435456
         queue_size:
           type: integer
           default: 1024

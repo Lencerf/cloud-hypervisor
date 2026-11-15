@@ -1,19 +1,24 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::result;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, LazyLock, Mutex, RwLock};
+use std::{io, result};
 
 use event_monitor::event;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
-use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
+use vhost::vhost_user::message::{
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+};
+use vhost::vhost_user::{
+    FrontendReqHandler, HandlerResult, VhostUserFrontend, VhostUserFrontendReqHandler,
+};
 use vm_device::UserspaceMapping;
-use vm_memory::ByteValued;
+use vm_memory::{Address, ByteValued};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -24,17 +29,203 @@ use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
 use crate::vhost_user::{VhostUserCommon, VhostUserState};
 use crate::{
-    ActivateResult, GuestRegion, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
-    VirtioDeviceType, VirtioSharedMemoryList,
+    ActivateError, ActivateResult, GuestRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
+    VirtioDevice, VirtioDeviceType, VirtioSharedMemoryList,
 };
 
 const NUM_QUEUE_OFFSET: u16 = 1;
 const DEFAULT_QUEUE_NUMBER: u16 = 2;
+const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 
 pub type State = VhostUserState<VirtioFsConfig>;
 
-struct BackendReqHandler {}
-impl VhostUserFrontendReqHandler for BackendReqHandler {}
+#[derive(Clone, Copy)]
+struct DaxWindowEntry {
+    gpa: u64,
+    len: u64,
+    hva: u64,
+}
+
+static DAX_WINDOWS: LazyLock<RwLock<Vec<DaxWindowEntry>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+
+fn register_dax_window(gpa: u64, len: u64, hva: u64) {
+    let mut windows = DAX_WINDOWS.write().unwrap();
+    if let Some(entry) = windows.iter_mut().find(|w| w.hva == hva) {
+        entry.gpa = gpa;
+        entry.len = len;
+    } else {
+        windows.push(DaxWindowEntry { gpa, len, hva });
+    }
+}
+
+fn unregister_dax_window(hva: u64) {
+    DAX_WINDOWS.write().unwrap().retain(|w| w.hva != hva);
+}
+
+/// Attempt to recover from a synchronous `KVM_EXIT_MEMORY_FAULT` inside an active virtio-fs DAX
+/// shared-memory window (for example, if a guest thread races with an external host truncation
+/// before `virtiofsd`'s `inotify` zero-remap finishes) by atomically replacing the faulting page
+/// range with anonymous zero-filled pages.
+pub fn try_zero_fill_dax_fault(gpa: u64, size: u64) -> bool {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let page_mask = !(page_size - 1);
+    let fault_len = size.max(page_size);
+
+    let target = {
+        let windows = DAX_WINDOWS.read().unwrap();
+        windows.iter().copied().find(|w| {
+            gpa >= w.gpa
+                && gpa
+                    .checked_sub(w.gpa)
+                    .is_some_and(|off| off < w.len)
+        })
+    };
+    let Some(win) = target else {
+        return false;
+    };
+
+    let aligned_gpa = (gpa & page_mask).max(win.gpa);
+    let win_end = win.gpa.saturating_add(win.len);
+    let fault_end = gpa
+        .saturating_add(fault_len)
+        .saturating_add(page_size - 1)
+        & page_mask;
+    let map_end = fault_end.min(win_end);
+    if map_end <= aligned_gpa {
+        return false;
+    }
+    let map_len = (map_end - aligned_gpa) as usize;
+    let map_hva = win.hva + (aligned_gpa - win.gpa);
+
+    // SAFETY: `[map_hva, map_hva + map_len)` lies strictly within the reserved DAX `MmapRegion`
+    // and is page-aligned.
+    let ret = unsafe {
+        libc::mmap(
+            map_hva as *mut libc::c_void,
+            map_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if ret == libc::MAP_FAILED {
+        error!(
+            "Failed to zero-map faulting virtio-fs DAX range gpa={aligned_gpa:#x} len={map_len:#x}: {}",
+            io::Error::last_os_error()
+        );
+        return false;
+    }
+    warn!(
+        "Recovered synchronous KVM memory fault in virtio-fs DAX window at gpa={gpa:#x} (zero-mapped {map_len} bytes)"
+    );
+    true
+}
+
+/// Translate `[gpa, gpa + len)` within an active virtio-fs DAX window to a host pointer if covered.
+pub fn translate_dax_gpa(gpa: u64, len: usize) -> Option<*mut u8> {
+    let windows = DAX_WINDOWS.read().unwrap();
+    for w in windows.iter() {
+        if gpa >= w.gpa {
+            let off = gpa - w.gpa;
+            if off.checked_add(len as u64).is_some_and(|end| end <= w.len) {
+                return Some((w.hva + off) as *mut u8);
+            }
+        }
+    }
+    None
+}
+
+struct BackendReqHandler {
+    cache_size: u64,
+    mmap_cache_addr: u64,
+}
+
+impl BackendReqHandler {
+    #[inline]
+    fn is_req_valid(&self, offset: u64, len: u64) -> bool {
+        match offset.checked_add(len) {
+            Some(end) => offset < self.cache_size && end <= self.cache_size,
+            None => false,
+        }
+    }
+}
+
+impl VhostUserFrontendReqHandler for BackendReqHandler {
+    fn handle_config_change(&self) -> HandlerResult<u64> {
+        debug!("virtio-fs handle_config_change");
+        Ok(0)
+    }
+
+    fn shmem_map(&self, req: &VhostUserMMap, fd: &dyn AsRawFd) -> HandlerResult<u64> {
+        if req.shmid != VIRTIO_FS_SHMCAP_ID_CACHE || req.len == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if !self.is_req_valid(req.shm_offset, req.len) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let flags = VhostUserMMapFlags::from_bits(req.flags)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let prot = libc::PROT_READ
+            | if flags.contains(VhostUserMMapFlags::WRITABLE) {
+                libc::PROT_WRITE
+            } else {
+                0
+            };
+
+        let addr = self.mmap_cache_addr + req.shm_offset;
+        // SAFETY: `[addr, addr + req.len)` was validated to lie within `self.mmap_cache_addr..+cache_size`
+        // and `fd` is a valid file descriptor received via `SCM_RIGHTS`.
+        let ret = unsafe {
+            libc::mmap(
+                addr as *mut libc::c_void,
+                req.len as usize,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                req.fd_offset as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(0)
+    }
+
+    fn shmem_unmap(&self, req: &VhostUserMMap) -> HandlerResult<u64> {
+        if req.shmid != VIRTIO_FS_SHMCAP_ID_CACHE {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if req.len == 0 {
+            return Ok(0);
+        }
+        let (offset, len) = if req.len == u64::MAX {
+            (0, self.cache_size)
+        } else {
+            (req.shm_offset, req.len)
+        };
+        if !self.is_req_valid(offset, len) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let addr = self.mmap_cache_addr + offset;
+        // SAFETY: `[addr, addr + len)` lies strictly within the reserved DAX `MmapRegion`.
+        let ret = unsafe {
+            libc::mmap(
+                addr as *mut libc::c_void,
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(0)
+    }
+}
 
 pub const VIRTIO_FS_TAG_LEN: usize = 36;
 #[serde_as]
@@ -62,9 +253,8 @@ pub struct Fs {
     vu_common: VhostUserCommon,
     id: String,
     config: VirtioFsConfig,
-    // Hold ownership of the memory that is allocated for the device
-    // which will be automatically dropped when the device is dropped
-    cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+    // Hold ownership of the DAX shared memory window mapping allocated for the device.
+    cache: Option<VirtioSharedMemoryList>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -78,18 +268,16 @@ impl Fs {
         tag: &str,
         req_num_queues: u16,
         queue_size: u16,
-        cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+        cache: Option<VirtioSharedMemoryList>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
     ) -> Result<Fs> {
-        // Calculate the actual number of queues needed.
         let num_queues = req_num_queues
             .checked_add(NUM_QUEUE_OFFSET)
             .ok_or(Error::BadQueueNum)?;
 
-        // Connect to the vhost-user socket.
         let mut vu =
             VhostUserHandle::connect_vhost_user(false, path, num_queues, false, &exit_evt, |_| {
                 Ok(())
@@ -123,18 +311,46 @@ impl Fs {
                 state.vring_bases,
             )
         } else {
-            // Filling device and vring features VMM supports.
             let avail_features = DEFAULT_VIRTIO_FEATURES;
 
-            let avail_protocol_features = VhostUserProtocolFeatures::MQ
+            let mut avail_protocol_features = VhostUserProtocolFeatures::MQ
                 | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                 | VhostUserProtocolFeatures::REPLY_ACK
                 | VhostUserProtocolFeatures::INFLIGHT_SHMFD
                 | VhostUserProtocolFeatures::LOG_SHMFD
                 | VhostUserProtocolFeatures::DEVICE_STATE;
+            if cache.is_some() {
+                avail_protocol_features |= VhostUserProtocolFeatures::BACKEND_REQ
+                    | VhostUserProtocolFeatures::BACKEND_SEND_FD
+                    | VhostUserProtocolFeatures::SHMEM;
+            }
 
             let (acked_features, acked_protocol_features) =
                 vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
+
+            if let Some(ref shm) = cache {
+                let required = (VhostUserProtocolFeatures::BACKEND_REQ
+                    | VhostUserProtocolFeatures::BACKEND_SEND_FD
+                    | VhostUserProtocolFeatures::SHMEM)
+                    .bits();
+                if acked_protocol_features & required != required {
+                    error!(
+                        "vhost-user-fs DAX enabled (cache_size={} MiB), but backend did not negotiate SHMEM+BACKEND_REQ+BACKEND_SEND_FD (acked={acked_protocol_features:#x})",
+                        shm.mapping.size() >> 20
+                    );
+                    return Err(Error::UnsupportedProtocolFeatures(required));
+                }
+                if let Ok(shmem_cfg) = vu.socket_handle().get_shmem_config()
+                    && shmem_cfg.nregions >= 1
+                    && shmem_cfg.memory_sizes[0] != shm.mapping.size() as u64
+                {
+                    warn!(
+                        "vhost-user-fs backend reported SHMEM size {} bytes vs VMM cache_size {} bytes",
+                        shmem_cfg.memory_sizes[0],
+                        shm.mapping.size()
+                    );
+                }
+            }
 
             let backend_num_queues =
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
@@ -152,15 +368,10 @@ impl Fs {
                 return Err(Error::BadQueueNum);
             }
 
-            // Create virtio-fs device configuration.
             let mut config = VirtioFsConfig::default();
             let tag_bytes_slice = tag.as_bytes();
-            let len = if tag_bytes_slice.len() < config.tag.len() {
-                tag_bytes_slice.len()
-            } else {
-                config.tag.len()
-            };
-            config.tag[..len].copy_from_slice(tag_bytes_slice[..len].as_ref());
+            let len = tag_bytes_slice.len().min(config.tag.len());
+            config.tag[..len].copy_from_slice(&tag_bytes_slice[..len]);
             config.num_request_queues = req_num_queues as u32;
 
             let mut avail_features = acked_features;
@@ -170,10 +381,6 @@ impl Fs {
 
             (
                 avail_features,
-                // If part of the available features that have been acked, the
-                // PROTOCOL_FEATURES bit must be already set through the VIRTIO
-                // acked features as we know the guest would never ack it, thus
-                // the feature would be lost.
                 acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
                 acked_protocol_features,
                 num_queues,
@@ -182,6 +389,14 @@ impl Fs {
                 None,
             )
         };
+
+        if let Some(ref shm) = cache {
+            register_dax_window(
+                shm.addr.raw_value(),
+                shm.mapping.size() as u64,
+                shm.mapping.as_ptr() as u64,
+            );
+        }
 
         Ok(Fs {
             vu_common: VhostUserCommon {
@@ -217,6 +432,9 @@ impl Fs {
 
 impl Drop for Fs {
     fn drop(&mut self) {
+        if let Some(ref shm) = self.cache {
+            unregister_dax_window(shm.mapping.as_ptr() as u64);
+        }
         self.vu_common.shutdown();
     }
 }
@@ -253,9 +471,29 @@ impl VirtioDevice for Fs {
             .virtio_common
             .activate(&queues, Arc::clone(&interrupt_cb))?;
 
-        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
-        // Run a dedicated thread for handling potential reconnections with
-        // the backend.
+        let shmem_bits =
+            (VhostUserProtocolFeatures::BACKEND_REQ | VhostUserProtocolFeatures::SHMEM).bits();
+        let backend_req_handler = if let Some(ref shm) = self.cache
+            && (self.vu_common.acked_protocol_features & shmem_bits) == shmem_bits
+        {
+            let vu_frontend_req_handler = Arc::new(BackendReqHandler {
+                cache_size: shm.mapping.size() as u64,
+                mmap_cache_addr: shm.mapping.as_ptr() as u64,
+            });
+            let mut req_handler =
+                FrontendReqHandler::new(vu_frontend_req_handler).map_err(|e| {
+                    ActivateError::VhostUserSetup(Error::FrontendReqHandlerCreation(e))
+                })?;
+            if self.vu_common.acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits()
+                != 0
+            {
+                req_handler.set_reply_ack_flag(true);
+            }
+            Some(req_handler)
+        } else {
+            None
+        };
+
         let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
 
         let mut handler = self.vu_common.activate(
@@ -294,7 +532,7 @@ impl VirtioDevice for Fs {
     }
 
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        self.cache.as_ref().map(|cache| cache.0.clone())
+        self.cache.clone()
     }
 
     fn set_shm_regions(
@@ -302,7 +540,12 @@ impl VirtioDevice for Fs {
         shm_regions: VirtioSharedMemoryList,
     ) -> result::Result<(), crate::Error> {
         if let Some(cache) = self.cache.as_mut() {
-            cache.0 = shm_regions;
+            register_dax_window(
+                shm_regions.addr.raw_value(),
+                shm_regions.mapping.size() as u64,
+                shm_regions.mapping.as_ptr() as u64,
+            );
+            *cache = shm_regions;
             Ok(())
         } else {
             Err(crate::Error::SetShmRegionsNotSupported)
@@ -315,11 +558,11 @@ impl VirtioDevice for Fs {
 
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
         let mut mappings = Vec::new();
-        if let Some(cache) = self.cache.as_ref() {
+        if let Some(shm) = self.cache.as_ref() {
             mappings.push(UserspaceMapping {
-                mem_slot: cache.0.mem_slot,
-                addr: cache.0.addr,
-                mapping: Arc::clone(&cache.0.mapping),
+                mem_slot: shm.mem_slot,
+                addr: shm.addr,
+                mapping: Arc::clone(&shm.mapping),
                 mergeable: false,
             });
         }

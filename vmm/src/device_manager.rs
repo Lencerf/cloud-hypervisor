@@ -91,8 +91,8 @@ use iommufd_ioctls::IommuFd;
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
 use iommufd_ioctls::{AttachHwpt, IommufdVIommu};
 use libc::{
-    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW, tcsetattr,
-    termios,
+    MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_NONE, PROT_READ,
+    PROT_WRITE, TCSANOW, tcsetattr, termios,
 };
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
@@ -118,7 +118,8 @@ use virtio_devices::transport::{
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
-    balloon, mem, net, transport, vdpa, vhost_user, vsock,
+    VirtioSharedMemory, VirtioSharedMemoryList, balloon, mem, net, transport, vdpa, vhost_user,
+    vsock,
 };
 use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, GuestRegionError, InterruptAllocError, SystemAllocator};
@@ -358,6 +359,14 @@ pub enum DeviceManagerError {
     /// Cannot find a memory range for persistent memory
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
+
+    /// Cannot find a memory range for virtio-fs DAX window
+    #[error("Cannot find a memory range for virtio-fs DAX window")]
+    FsRangeAllocation,
+
+    /// Failed to register virtio-fs DAX userspace memory region
+    #[error("Failed to register virtio-fs DAX userspace memory region")]
+    FsCreateUserMemoryRegion(#[source] hypervisor::HypervisorVmError),
 
     /// Cannot create iommufd
     #[cfg(feature = "kvm")]
@@ -3407,7 +3416,99 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
+        let cache_range = if let Some(existing_node) = self.device_tree.lock().unwrap().get(&id) {
+            info!("Restoring virtio-fs {id} resources");
+            let mut range: Option<(u64, u64)> = None;
+            for resource in existing_node.resources.iter() {
+                if let Resource::MmioAddressRange { base, size } = resource {
+                    if range.is_some() {
+                        return Err(DeviceManagerError::ResourceAlreadyExists);
+                    }
+                    range = Some((*base, *size));
+                }
+            }
+            range
+        } else {
+            None
+        };
+
         if let Some(fs_socket) = fs_cfg.socket.to_str() {
+            let cache = if fs_cfg.dax {
+                let (cache_base, cache_size) = if let Some((base, size)) = cache_range {
+                    self.pci_segments[fs_cfg.pci_common.pci_segment as usize]
+                        .mem64_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate(
+                            Some(GuestAddress(base)),
+                            size as GuestUsize,
+                            Some(0x0020_0000),
+                        )
+                        .ok_or(DeviceManagerError::FsRangeAllocation)?;
+                    (base, size)
+                } else {
+                    let size = fs_cfg.cache_size;
+                    let base = self.pci_segments[fs_cfg.pci_common.pci_segment as usize]
+                        .mem64_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate(None, size as GuestUsize, Some(0x0020_0000))
+                        .ok_or(DeviceManagerError::FsRangeAllocation)?;
+                    (base.raw_value(), size)
+                };
+
+                node.resources.push(Resource::MmioAddressRange {
+                    base: cache_base,
+                    size: cache_size,
+                });
+
+                let mmap_region = Arc::new(
+                    MmapRegion::build(
+                        None,
+                        cache_size as usize,
+                        PROT_NONE,
+                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
+                    )
+                    .map_err(DeviceManagerError::NewMmapRegion)?,
+                );
+
+                let mem_slot = self
+                    .memory_manager
+                    .lock()
+                    .unwrap()
+                    .memory_slot_allocator()
+                    .next_memory_slot();
+
+                // SAFETY: `mmap_region` stays alive inside `Fs` until `remove_userspace_mapping`
+                // unregisters `mem_slot` on device teardown.
+                unsafe {
+                    self.address_manager
+                        .vm
+                        .create_user_memory_region(
+                            mem_slot,
+                            cache_base,
+                            cache_size as usize,
+                            mmap_region.as_ptr(),
+                            false,
+                            false,
+                            hypervisor::MemoryVisibility::Shared,
+                        )
+                        .map_err(DeviceManagerError::FsCreateUserMemoryRegion)?;
+                }
+
+                Some(VirtioSharedMemoryList {
+                    mem_slot,
+                    addr: GuestAddress(cache_base),
+                    mapping: mmap_region,
+                    region_list: vec![VirtioSharedMemory {
+                        offset: 0,
+                        len: cache_size,
+                    }],
+                })
+            } else {
+                None
+            };
+
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),
@@ -3415,7 +3516,7 @@ impl DeviceManager {
                     &fs_cfg.tag,
                     fs_cfg.num_queues,
                     fs_cfg.queue_size,
-                    None,
+                    cache,
                     self.seccomp_action.clone(),
                     self.exit_evt
                         .try_clone()

@@ -2577,6 +2577,19 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
 
+                #[cfg(not(feature = "sev_snp"))]
+                VcpuExit::MemoryFault { flags, gpa, size } => {
+                    if flags == 0
+                        && let Some(vm_ops) = &self.vm_ops
+                        && vm_ops.handle_memory_fault(gpa, size)
+                    {
+                        return Ok(cpu::VmExit::Ignore);
+                    }
+                    Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "Unhandled VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}"
+                    )))
+                }
+
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                     "Unexpected exit reason on vcpu run: {r:?}"
                 ))),

@@ -385,17 +385,35 @@ struct VmOpsHandler {
 
 impl VmOps for VmOpsHandler {
     fn guest_mem_write(&self, gpa: u64, buf: &[u8]) -> result::Result<usize, HypervisorVmError> {
-        self.memory
-            .memory()
-            .write(buf, GuestAddress(gpa))
-            .map_err(HypervisorVmError::GuestMemWrite)
+        match self.memory.memory().write(buf, GuestAddress(gpa)) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                if let Some(dst) = virtio_devices::vhost_user::translate_dax_gpa(gpa, buf.len()) {
+                    unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+                    Ok(buf.len())
+                } else {
+                    Err(HypervisorVmError::GuestMemWrite(e))
+                }
+            }
+        }
     }
 
     fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> result::Result<usize, HypervisorVmError> {
-        self.memory
-            .memory()
-            .read(buf, GuestAddress(gpa))
-            .map_err(HypervisorVmError::GuestMemRead)
+        match self.memory.memory().read(buf, GuestAddress(gpa)) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                if let Some(src) = virtio_devices::vhost_user::translate_dax_gpa(gpa, buf.len()) {
+                    unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()) };
+                    Ok(buf.len())
+                } else {
+                    Err(HypervisorVmError::GuestMemRead(e))
+                }
+            }
+        }
+    }
+
+    fn handle_memory_fault(&self, gpa: u64, size: u64) -> bool {
+        virtio_devices::vhost_user::try_zero_fill_dax_fault(gpa, size)
     }
 
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {

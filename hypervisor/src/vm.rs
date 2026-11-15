@@ -406,4 +406,7 @@ pub trait VmOps: Send + Sync {
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> Result<()>;
+    fn handle_memory_fault(&self, _gpa: u64, _size: u64) -> bool {
+        false
+    }
 }

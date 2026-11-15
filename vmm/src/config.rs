@@ -66,6 +66,12 @@ pub enum Error {
     /// Filesystem socket is missing
     #[error("Error parsing --fs: socket missing")]
     ParseFsSockMissing,
+    /// Cannot have dax=off along with cache_size parameter
+    #[error("Error parsing --fs: cache_size used with dax=off")]
+    InvalidCacheSizeWithDaxOff,
+    /// Invalid DAX cache_size alignment
+    #[error("Error parsing --fs: cache_size must be a non-zero multiple of 2 MiB")]
+    InvalidFsCacheSizeAlignment,
     /// Generic vhost-user device type is invalid
     #[error(
         "Error parsing --generic-vhost-user: device_type {0:?} invalid (leading zeros or unknown string)"
@@ -2403,13 +2409,15 @@ impl GenericVhostUserConfig {
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+    queue_size=<size_of_each_queue>,dax=on|off,cache_size=<DAX cache size: \
+    default 256M>,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
             .add("tag")
+            .add("dax")
+            .add("cache_size")
             .add("queue_size")
             .add("num_queues")
             .add("socket")
@@ -2431,6 +2439,26 @@ impl FsConfig {
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_else(default_fsconfig_num_queues);
 
+        let dax = parser
+            .convert::<Toggle>("dax")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(|| Toggle(default_fsconfig_dax()))
+            .0;
+
+        if parser.is_set("cache_size") && !dax {
+            return Err(Error::InvalidCacheSizeWithDaxOff);
+        }
+
+        let cache_size = parser
+            .convert::<ByteSized>("cache_size")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(|| ByteSized(default_fsconfig_cache_size()))
+            .0;
+
+        if dax && (cache_size < 0x0020_0000 || !cache_size.is_multiple_of(0x0020_0000)) {
+            return Err(Error::InvalidFsCacheSizeAlignment);
+        }
+
         let pci_common = PciDeviceCommonConfig::parse(fs)?;
 
         Ok(FsConfig {
@@ -2439,6 +2467,8 @@ impl FsConfig {
             socket,
             num_queues,
             queue_size,
+            dax,
+            cache_size,
         })
     }
 
@@ -6053,6 +6083,8 @@ mod tests {
             tag: "mytag".to_owned(),
             num_queues: 1,
             queue_size: 1024,
+            dax: default_fsconfig_dax(),
+            cache_size: default_fsconfig_cache_size(),
         }
     }
 
@@ -6071,6 +6103,15 @@ mod tests {
                 ..fs_fixture()
             }
         );
+        assert_eq!(
+            FsConfig::parse("tag=mytag,socket=/tmp/sock,dax=on,cache_size=512M")?,
+            FsConfig {
+                dax: true,
+                cache_size: 512 << 20,
+                ..fs_fixture()
+            }
+        );
+        assert!(FsConfig::parse("tag=mytag,socket=/tmp/sock,dax=off,cache_size=512M").is_err());
 
         Ok(())
     }
@@ -7577,6 +7618,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             socket: PathBuf::from("/tmp/fs.sock"),
             num_queues: 0,
             queue_size: 1024,
+            dax: default_fsconfig_dax(),
+            cache_size: default_fsconfig_cache_size(),
         }]);
         assert_eq!(
             invalid_config.validate(),
