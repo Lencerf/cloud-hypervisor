@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use std::{ffi, fs, io};
 
@@ -68,6 +68,7 @@ pub struct VhostUserHandle {
     vu: Frontend,
     backend_features: u64,
     ready: bool,
+    paused: bool,
     supports_migration: bool,
     supports_device_state: bool,
     shm_log: Option<Arc<MmapRegion>>,
@@ -76,9 +77,14 @@ pub struct VhostUserHandle {
     queue_indexes: Vec<u16>,
     vring_bases: Option<Vec<u64>>,
     postcopy_ctx: Option<PostcopyContext>,
+    enabled_queues: Option<Arc<AtomicU16>>,
 }
 
 impl VhostUserHandle {
+    pub fn set_enabled_queues_tracker(&mut self, enabled_queues: Option<Arc<AtomicU16>>) {
+        self.enabled_queues = enabled_queues;
+    }
+
     pub fn update_mem_table(&mut self, mem: &GuestMemory) -> Result<()> {
         let mut regions: Vec<VhostUserMemoryRegionInfo> = Vec::new();
         for region in mem.iter() {
@@ -376,7 +382,8 @@ impl VhostUserHandle {
             self.queue_indexes.push(*queue_index);
         }
 
-        self.enable_vhost_user_vrings(self.queue_indexes.clone(), true)?;
+        self.paused = false;
+        self.sync_vhost_user_vrings()?;
 
         if let Some(backend_req_handler) = backend_req_handler {
             self.vu
@@ -390,7 +397,44 @@ impl VhostUserHandle {
         Ok(())
     }
 
+    fn apply_vhost_user_vrings(&mut self, enabled_limit: Option<u16>) -> Result<()> {
+        if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+            return Ok(());
+        }
+
+        for &queue_index in &self.queue_indexes {
+            let enable = enabled_limit.is_none_or(|limit| queue_index < limit);
+            self.vu
+                .set_vring_enable(queue_index as usize, enable)
+                .map_err(Error::VhostUserSetVringEnable)?;
+        }
+
+        Ok(())
+    }
+
+    fn sync_vhost_user_vrings(&mut self) -> Result<()> {
+        let enabled_limit = self
+            .enabled_queues
+            .as_ref()
+            .map(|n| n.load(Ordering::Acquire));
+        self.apply_vhost_user_vrings(enabled_limit)
+    }
+
+    pub fn update_enabled_queues(&mut self, num_queues: u16) -> Result<()> {
+        if self.ready && !self.paused {
+            self.apply_vhost_user_vrings(Some(num_queues))?;
+        }
+        if let Some(enabled_queues) = &self.enabled_queues {
+            enabled_queues.store(num_queues, Ordering::Release);
+        }
+        Ok(())
+    }
+
     fn enable_vhost_user_vrings(&mut self, queue_indexes: Vec<u16>, enable: bool) -> Result<()> {
+        if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+            return Ok(());
+        }
+
         for queue_index in queue_indexes {
             self.vu
                 .set_vring_enable(queue_index as usize, enable)
@@ -401,16 +445,23 @@ impl VhostUserHandle {
     }
 
     pub fn reset_vhost_user(&mut self) -> Result<()> {
+        let has_protocol_features =
+            self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0;
         for queue_index in self.queue_indexes.drain(..) {
-            self.vu
-                .set_vring_enable(queue_index as usize, false)
-                .map_err(Error::VhostUserSetVringEnable)?;
+            if has_protocol_features {
+                self.vu
+                    .set_vring_enable(queue_index as usize, false)
+                    .map_err(Error::VhostUserSetVringEnable)?;
+            }
 
             let _ = self
                 .vu
                 .get_vring_base(queue_index as usize)
                 .map_err(Error::VhostUserGetVringBase)?;
         }
+
+        self.ready = false;
+        self.paused = false;
 
         Ok(())
     }
@@ -494,8 +545,14 @@ impl VhostUserHandle {
             vring_bases.as_deref(),
         )?;
 
-        for (_, _, queue_evt) in queues {
-            queue_evt.write(1).map_err(Error::VhostUserKickVring)?;
+        let enabled_limit = self
+            .enabled_queues
+            .as_ref()
+            .map(|n| n.load(Ordering::Acquire));
+        for (queue_index, _, queue_evt) in queues {
+            if enabled_limit.is_none_or(|limit| *queue_index < limit) {
+                queue_evt.write(1).map_err(Error::VhostUserKickVring)?;
+            }
         }
 
         Ok(())
@@ -538,6 +595,7 @@ impl VhostUserHandle {
                 vu: Frontend::from_stream(stream, num_queues as u64),
                 backend_features: 0,
                 ready: false,
+                paused: false,
                 supports_migration: false,
                 supports_device_state: false,
                 shm_log: None,
@@ -546,6 +604,7 @@ impl VhostUserHandle {
                 queue_indexes: Vec::new(),
                 vring_bases: None,
                 postcopy_ctx: None,
+                enabled_queues: None,
             };
             vhost_user
                 .vu
@@ -595,6 +654,7 @@ impl VhostUserHandle {
                         vu,
                         backend_features: 0,
                         ready: false,
+                        paused: false,
                         supports_migration: false,
                         supports_device_state: false,
                         shm_log: None,
@@ -603,6 +663,7 @@ impl VhostUserHandle {
                         queue_indexes: Vec::new(),
                         vring_bases: None,
                         postcopy_ctx: None,
+                        enabled_queues: None,
                     })
                     .map_err(Error::VhostUserConnect);
 
@@ -688,6 +749,7 @@ impl VhostUserHandle {
     }
 
     pub fn pause_vhost_user(&mut self) -> Result<()> {
+        self.paused = true;
         if self.ready {
             self.enable_vhost_user_vrings(self.queue_indexes.clone(), false)?;
         }
@@ -696,8 +758,9 @@ impl VhostUserHandle {
     }
 
     fn resume_vhost_user(&mut self) -> Result<()> {
+        self.paused = false;
         if self.ready {
-            self.enable_vhost_user_vrings(self.queue_indexes.clone(), true)?;
+            self.sync_vhost_user_vrings()?;
         }
 
         Ok(())

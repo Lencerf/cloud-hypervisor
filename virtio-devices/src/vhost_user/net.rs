@@ -48,6 +48,8 @@ pub struct Net {
     vu_common: VhostUserCommon,
     id: String,
     config: VirtioNetConfig,
+    curr_queue_pairs: Arc<AtomicU16>,
+    enabled_queues: Arc<AtomicU16>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     announce: AnnouncementState,
@@ -110,6 +112,7 @@ impl Net {
             paused,
             vring_bases,
             announce_pending,
+            curr_queue_pairs,
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-net {id}");
 
@@ -131,6 +134,10 @@ impl Net {
             let announce_pending =
                 (state.acked_features & (1u64 << VIRTIO_NET_F_GUEST_ANNOUNCE)) != 0;
 
+            // Older snapshots without curr_queue_pairs keep every configured pair enabled.
+            let default_pairs = (state.vu_num_queues / 2).max(1);
+            let curr_queue_pairs = state.curr_queue_pairs.unwrap_or(default_pairs);
+
             (
                 state.avail_features,
                 state.acked_features,
@@ -140,6 +147,7 @@ impl Net {
                 true,
                 state.vring_bases,
                 announce_pending,
+                curr_queue_pairs,
             )
         } else {
             // Filling device and vring features VMM supports.
@@ -263,12 +271,16 @@ impl Net {
                 false,
                 None,
                 false,
+                1,
             )
         };
 
         if let Some(postcopy_handler) = postcopy_handler {
             vu.start_postcopy(id.clone(), postcopy_handler)?;
         }
+
+        let enabled_queues = Arc::new(AtomicU16::new(curr_queue_pairs.saturating_mul(2)));
+        let curr_queue_pairs = Arc::new(AtomicU16::new(curr_queue_pairs));
 
         let virtio_common = VirtioCommon {
             device_type: VirtioDeviceType::Net as u32,
@@ -288,9 +300,12 @@ impl Net {
                 vu_num_queues,
                 server,
                 vring_bases,
+                enabled_queues: Some(Arc::clone(&enabled_queues)),
                 ..VhostUserCommon::new(virtio_common)
             },
             config,
+            curr_queue_pairs,
+            enabled_queues,
             seccomp_action,
             exit_evt,
             announce: AnnouncementState::new(announce_pending).map_err(Error::CreateEventFd)?,
@@ -298,7 +313,31 @@ impl Net {
     }
 
     fn state(&self) -> result::Result<State, MigratableError> {
-        self.vu_common.state(self.config)
+        let mut state = self.vu_common.state(self.config)?;
+        state.curr_queue_pairs = Some(self.curr_queue_pairs.load(Ordering::Acquire));
+        Ok(state)
+    }
+
+    /// Compute `(curr_queue_pairs, ctrl_max_virtqueue_pairs)` for activation
+    /// from the activated data queues and negotiated features.
+    fn active_mq_params(&self, data_queues_len: usize) -> (u16, u16) {
+        let active_pairs = (data_queues_len / 2) as u16;
+        let mq_acked = self
+            .vu_common
+            .virtio_common
+            .feature_acked(VIRTIO_NET_F_MQ.into());
+        let max_pairs = if mq_acked {
+            active_pairs.min(self.config.max_virtqueue_pairs)
+        } else {
+            1
+        };
+        let curr_queue_pairs = self
+            .curr_queue_pairs
+            .load(Ordering::Acquire)
+            .min(max_pairs)
+            .max(1);
+        let ctrl_max_virtqueue_pairs = if mq_acked { max_pairs } else { 0 };
+        (curr_queue_pairs, ctrl_max_virtqueue_pairs)
     }
 
     /// Compute the guest-visible virtio-net status field.
@@ -371,18 +410,49 @@ impl VirtioDevice for Net {
             .vu_common
             .virtio_common
             .feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
-        if self
+        let has_ctrl_queue = self
             .vu_common
             .virtio_common
             .feature_acked(VIRTIO_NET_F_CTRL_VQ.into())
-            && !num_queues.is_multiple_of(2)
-        {
-            let ctrl_queue_index = num_queues - 1;
-            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index as usize);
+            && !num_queues.is_multiple_of(2);
 
+        let ctrl_queue_info = if has_ctrl_queue {
+            let ctrl_queue_index = num_queues - 1;
+            Some((ctrl_queue_index, queues.remove(ctrl_queue_index as usize)))
+        } else {
+            None
+        };
+
+        if !queues.len().is_multiple_of(2) {
+            return Err(ActivateError::BadActivate);
+        }
+
+        let (curr_queue_pairs, ctrl_max_virtqueue_pairs) = self.active_mq_params(queues.len());
+        self.curr_queue_pairs
+            .store(curr_queue_pairs, Ordering::Release);
+        self.enabled_queues
+            .store(curr_queue_pairs.saturating_mul(2), Ordering::Release);
+
+        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
+
+        // Configure the vhost-user backend before starting the worker threads so
+        // only the active queue pairs are enabled and ready for control commands.
+        let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
+
+        let mut handler = self.vu_common.activate(
+            mem.clone(),
+            &queues,
+            Arc::clone(&interrupt_cb),
+            self.vu_common.virtio_common.acked_features,
+            backend_req_handler,
+            kill_evt,
+            pause_evt,
+        )?;
+
+        if let Some((ctrl_queue_index, (_, mut ctrl_queue, ctrl_queue_evt))) = ctrl_queue_info {
             ctrl_queue.set_event_idx(event_idx);
 
-            let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
+            let (ctrl_kill_evt, ctrl_pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
 
             let announce_ops = VirtioNetGuestAnnounceOps::new(
                 Arc::clone(&interrupt_cb),
@@ -397,17 +467,37 @@ impl VirtioDevice for Net {
                 vec![Box::new(announce_ops) as Box<dyn AnnounceOps>].into_boxed_slice(),
             );
 
+            let vu = Arc::clone(
+                self.vu_common
+                    .vu
+                    .as_ref()
+                    .ok_or(ActivateError::BadActivate)?,
+            );
+            let dev_id = self.id.clone();
+            let ctrl_q = CtrlQueue::new(
+                Vec::new(),
+                Arc::clone(&self.announce.pending),
+                ctrl_max_virtqueue_pairs,
+                Arc::clone(&self.curr_queue_pairs),
+                self.vu_common.virtio_common.acked_features,
+            )
+            .with_mq_callback(move |queue_pairs| {
+                vu.lock()
+                    .unwrap()
+                    .update_enabled_queues(queue_pairs.saturating_mul(2))
+                    .inspect_err(|e| {
+                        error!(
+                            "Failed updating enabled vhost-user queues for {dev_id} to {queue_pairs} pairs: {e:?}"
+                        );
+                    })
+                    .is_ok()
+            });
+
             let mut ctrl_handler = NetCtrlEpollHandler {
-                mem: mem.clone(),
-                kill_evt,
-                pause_evt,
-                ctrl_q: CtrlQueue::new(
-                    Vec::new(),
-                    Arc::clone(&self.announce.pending),
-                    self.config.max_virtqueue_pairs,
-                    Arc::new(AtomicU16::new(1)),
-                    self.vu_common.virtio_common.acked_features,
-                ),
+                mem,
+                kill_evt: ctrl_kill_evt,
+                pause_evt: ctrl_pause_evt,
+                ctrl_q,
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,
@@ -422,7 +512,7 @@ impl VirtioDevice for Net {
                 announcer,
             };
 
-            self.vu_common.virtio_common.spawn_worker(
+            self.vu_common.spawn_worker(
                 &format!("{}_ctrl", self.id),
                 &self.seccomp_action,
                 Thread::VirtioVhostNetCtl,
@@ -432,22 +522,6 @@ impl VirtioDevice for Net {
                 move |pause_common| ctrl_handler.run_ctrl(pause_common),
             )?;
         }
-
-        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
-
-        // Run a dedicated thread for handling potential reconnections with
-        // the backend.
-        let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds()?;
-
-        let mut handler = self.vu_common.activate(
-            mem,
-            &queues,
-            Arc::clone(&interrupt_cb),
-            self.vu_common.virtio_common.acked_features,
-            backend_req_handler,
-            kill_evt,
-            pause_evt,
-        )?;
 
         self.vu_common.spawn_worker(
             &self.id,
@@ -471,6 +545,8 @@ impl VirtioDevice for Net {
     fn reset(&mut self) {
         self.vu_common.reset(&self.id);
         self.announce.reset();
+        self.curr_queue_pairs.store(1, Ordering::Release);
+        self.enabled_queues.store(2, Ordering::Release);
     }
 
     fn shutdown(&mut self) {
@@ -544,6 +620,7 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     use seccompiler::SeccompAction;
+    use serde::Serialize;
     use virtio_bindings::virtio_net::{VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP};
     use vmm_sys_util::eventfd::EventFd;
 
@@ -559,11 +636,17 @@ mod tests {
             interrupt_cb,
             ..VirtioCommon::new(false).unwrap()
         };
+        let enabled_queues = Arc::new(AtomicU16::new(2));
 
         Ok(Net {
-            vu_common: VhostUserCommon::new(virtio_common),
+            vu_common: VhostUserCommon {
+                enabled_queues: Some(Arc::clone(&enabled_queues)),
+                ..VhostUserCommon::new(virtio_common)
+            },
             id: "test-vu-net".to_string(),
             config: VirtioNetConfig::default(),
+            curr_queue_pairs: Arc::new(AtomicU16::new(1)),
+            enabled_queues,
             seccomp_action: SeccompAction::Allow,
             exit_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
             announce: AnnouncementState::new(false).map_err(Error::CreateEventFd)?,
@@ -589,5 +672,346 @@ mod tests {
         let net = test_net(1 << VIRTIO_NET_F_STATUS, None).unwrap();
 
         assert_eq!(read_status(&net), VIRTIO_NET_S_LINK_UP as u16);
+    }
+
+    #[test]
+    fn test_restore_state_without_curr_queue_pairs_keeps_all_pairs() {
+        #[derive(Serialize)]
+        struct LegacyVhostUserNetState {
+            avail_features: u64,
+            acked_features: u64,
+            config: VirtioNetConfig,
+            acked_protocol_features: u64,
+            vu_num_queues: u16,
+        }
+
+        let snapshot = Snapshot::new_from_state(&LegacyVhostUserNetState {
+            avail_features: 0,
+            acked_features: 0,
+            config: VirtioNetConfig::default(),
+            acked_protocol_features: 0,
+            vu_num_queues: 8,
+        })
+        .unwrap();
+        let state: State = snapshot.to_state().unwrap();
+        assert_eq!(state.curr_queue_pairs, None);
+    }
+
+    #[test]
+    fn test_mq_vq_pairs_set_sends_set_vring_enable_and_tracks_state() {
+        use std::fs::File;
+        use std::io::{self, Read, Write};
+        use std::os::unix::io::FromRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::AtomicU8;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use vhost::vhost_user::message::{
+            FrontendReq, VhostUserHeaderFlag, VhostUserVirtioFeatures,
+        };
+        use virtio_bindings::virtio_net::{
+            VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, VIRTIO_NET_ERR, VIRTIO_NET_OK,
+        };
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        use vm_memory::{Bytes, FileOffset, GuestAddress, GuestMemoryAtomic};
+        use vm_virtio::queue::testing::VirtQueue as GuestQ;
+        use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+        use vmm_sys_util::tempdir::TempDir;
+
+        use crate::{VIRTIO_F_VERSION_1, VirtioInterruptType};
+
+        #[repr(C, packed)]
+        #[derive(Clone, Copy, Default)]
+        struct ControlHeader {
+            class: u8,
+            cmd: u8,
+        }
+        // SAFETY: ControlHeader is plain old data with no padding.
+        unsafe impl ByteValued for ControlHeader {}
+
+        struct CtrlNotifyInterrupt {
+            ctrl_queue_index: u16,
+            tx: Mutex<mpsc::Sender<()>>,
+        }
+
+        impl VirtioInterrupt for CtrlNotifyInterrupt {
+            fn trigger(&self, int_type: VirtioInterruptType) -> io::Result<()> {
+                if matches!(int_type, VirtioInterruptType::Queue(idx) if idx == self.ctrl_queue_index)
+                {
+                    let _ = self.tx.lock().unwrap().send(());
+                }
+                Ok(())
+            }
+
+            fn set_notifier(
+                &self,
+                _int_type: u32,
+                _notifier: Option<EventFd>,
+                _vm: &dyn hypervisor::Vm,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn recv_msg(stream: &mut UnixStream) -> Option<(u32, u32, Vec<u8>)> {
+            let mut hdr = [0u8; 12];
+            let mut fds = [0; 8];
+            let mut iovs = [libc::iovec {
+                iov_base: hdr.as_mut_ptr().cast(),
+                iov_len: hdr.len(),
+            }];
+            // SAFETY: hdr is owned and valid for 12 bytes; any received fds are closed below.
+            let (bytes, fd_count) = unsafe { stream.recv_with_fds(&mut iovs, &mut fds).ok()? };
+            for &fd in &fds[..fd_count] {
+                // SAFETY: fd was just received from the kernel via SCM_RIGHTS.
+                unsafe {
+                    drop(File::from_raw_fd(fd));
+                }
+            }
+            if bytes == 0 {
+                return None;
+            }
+            assert_eq!(bytes, 12);
+            let req = u32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+            let flags = u32::from_ne_bytes(hdr[4..8].try_into().unwrap());
+            let size = u32::from_ne_bytes(hdr[8..12].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; size];
+            if size > 0 {
+                stream.read_exact(&mut payload).unwrap();
+            }
+            Some((req, flags, payload))
+        }
+
+        fn send_u64_reply(stream: &mut UnixStream, req: u32, val: u64) {
+            let mut reply = Vec::with_capacity(20);
+            reply.extend_from_slice(&req.to_ne_bytes());
+            reply.extend_from_slice(&(VhostUserHeaderFlag::REPLY.bits() | 1).to_ne_bytes());
+            reply.extend_from_slice(&8u32.to_ne_bytes());
+            reply.extend_from_slice(&val.to_ne_bytes());
+            stream.write_all(&reply).unwrap();
+        }
+
+        let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-net-mq-").unwrap();
+        let socket_path = temp_dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let (vring_enable_tx, vring_enable_rx) = mpsc::channel::<(u32, bool)>();
+        let backend_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_NET_F_MQ)
+            | (1u64 << VIRTIO_NET_F_CTRL_VQ)
+            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let proto_features =
+            (VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK).bits();
+
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            while let Some((req, flags, payload)) = recv_msg(&mut stream) {
+                let need_reply = flags & VhostUserHeaderFlag::NEED_REPLY.bits() != 0;
+                if req == u32::from(FrontendReq::GET_FEATURES) {
+                    send_u64_reply(&mut stream, req, backend_features);
+                } else if req == u32::from(FrontendReq::GET_PROTOCOL_FEATURES) {
+                    send_u64_reply(&mut stream, req, proto_features);
+                } else if req == u32::from(FrontendReq::GET_QUEUE_NUM) {
+                    send_u64_reply(&mut stream, req, 4);
+                } else if req == u32::from(FrontendReq::GET_VRING_BASE) {
+                    let index = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
+                    let mut reply = Vec::with_capacity(20);
+                    reply.extend_from_slice(&req.to_ne_bytes());
+                    reply.extend_from_slice(&(VhostUserHeaderFlag::REPLY.bits() | 1).to_ne_bytes());
+                    reply.extend_from_slice(&8u32.to_ne_bytes());
+                    reply.extend_from_slice(&index.to_ne_bytes());
+                    reply.extend_from_slice(&0u32.to_ne_bytes());
+                    stream.write_all(&reply).unwrap();
+                } else if req == u32::from(FrontendReq::SET_VRING_ENABLE) {
+                    let index = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
+                    let num = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
+                    let _ = vring_enable_tx.send((index, num != 0));
+                    if need_reply {
+                        send_u64_reply(&mut stream, req, 0);
+                    }
+                } else if need_reply {
+                    send_u64_reply(&mut stream, req, 0);
+                }
+            }
+        });
+
+        let mut mac = None;
+        let mut net = Net::new(
+            "test-vu-net-mq".to_string(),
+            &mut mac,
+            None,
+            VhostUserConfig {
+                socket: socket_path.to_str().unwrap().to_string(),
+                num_queues: 4,
+                queue_size: 16,
+            },
+            false,
+            SeccompAction::Allow,
+            EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            false,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let guest_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_NET_F_MQ)
+            | (1u64 << VIRTIO_NET_F_CTRL_VQ);
+        net.ack_features(guest_features);
+
+        const MEM_SIZE: usize = 0x40_0000;
+        let mem_file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp_dir.as_path().join("guest_mem"))
+            .unwrap();
+        mem_file.set_len(MEM_SIZE as u64).unwrap();
+        let mem = crate::GuestMemory::from_ranges_with_files(&[(
+            GuestAddress(0),
+            MEM_SIZE,
+            Some(FileOffset::new(mem_file, 0)),
+        )])
+        .unwrap();
+
+        let mut queues = Vec::new();
+        for i in 0..4u16 {
+            let gq = GuestQ::new(GuestAddress(0x10_0000 + u64::from(i) * 0x1_0000), &mem, 16);
+            queues.push((
+                i,
+                gq.create_queue(),
+                EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            ));
+        }
+
+        let ctrl_gq = GuestQ::new(GuestAddress(0x20_0000), &mem, 16);
+        let ctrl_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let ctrl_evt_kick = ctrl_evt.try_clone().unwrap();
+        queues.push((4, ctrl_gq.create_queue(), ctrl_evt));
+
+        let (ctrl_done_tx, ctrl_done_rx) = mpsc::channel();
+        let interrupt_cb: Arc<dyn VirtioInterrupt> = Arc::new(CtrlNotifyInterrupt {
+            ctrl_queue_index: 4,
+            tx: Mutex::new(ctrl_done_tx),
+        });
+
+        net.activate(ActivationContext {
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            interrupt_cb,
+            queues,
+            device_status: Arc::new(AtomicU8::new(0)),
+        })
+        .unwrap();
+
+        let recv_four = |rx: &mpsc::Receiver<(u32, bool)>| -> Vec<(u32, bool)> {
+            (0..4)
+                .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .collect()
+        };
+
+        // 1. Initial activation enables only queue pair 0 (vrings 0, 1) and disables pair 1 (vrings 2, 3).
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, true), (1, true), (2, false), (3, false)]
+        );
+        assert_eq!(net.state().unwrap().curr_queue_pairs, Some(1));
+
+        let mut avail_idx = 0u16;
+        let send_mq_cmd = |pairs: u16, avail_idx: &mut u16| -> u8 {
+            const HDR_ADDR: u64 = 0x25_0000;
+            const DATA_ADDR: u64 = 0x25_1000;
+            const STATUS_ADDR: u64 = 0x25_2000;
+
+            ctrl_gq.dtable[0].set(
+                HDR_ADDR,
+                size_of::<ControlHeader>() as u32,
+                VRING_DESC_F_NEXT.try_into().unwrap(),
+                1,
+            );
+            ctrl_gq.dtable[1].set(
+                DATA_ADDR,
+                size_of::<u16>() as u32,
+                VRING_DESC_F_NEXT.try_into().unwrap(),
+                2,
+            );
+            ctrl_gq.dtable[2].set(STATUS_ADDR, 1, VRING_DESC_F_WRITE.try_into().unwrap(), 0);
+
+            mem.write_obj(
+                ControlHeader {
+                    class: VIRTIO_NET_CTRL_MQ as u8,
+                    cmd: VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET as u8,
+                },
+                GuestAddress(HDR_ADDR),
+            )
+            .unwrap();
+            mem.write_obj(pairs, GuestAddress(DATA_ADDR)).unwrap();
+            mem.write_obj(0xff_u8, GuestAddress(STATUS_ADDR)).unwrap();
+
+            let ring_slot = usize::from(*avail_idx % 16);
+            ctrl_gq.avail.ring[ring_slot].set(0);
+            *avail_idx = avail_idx.wrapping_add(1);
+            ctrl_gq.avail.idx.set(*avail_idx);
+
+            ctrl_evt_kick.write(1).unwrap();
+            while ctrl_gq.used.idx.get() != *avail_idx {
+                ctrl_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+
+            mem.read_obj::<u8>(GuestAddress(STATUS_ADDR)).unwrap()
+        };
+
+        // 2. Request 2 queue pairs -> enables all 4 vrings before returning VIRTIO_NET_OK.
+        assert_eq!(send_mq_cmd(2, &mut avail_idx), VIRTIO_NET_OK as u8);
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, true), (1, true), (2, true), (3, true)]
+        );
+        assert_eq!(net.state().unwrap().curr_queue_pairs, Some(2));
+
+        // 3. Request 1 queue pair -> disables vrings 2 and 3 before returning VIRTIO_NET_OK.
+        assert_eq!(send_mq_cmd(1, &mut avail_idx), VIRTIO_NET_OK as u8);
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, true), (1, true), (2, false), (3, false)]
+        );
+        assert_eq!(net.state().unwrap().curr_queue_pairs, Some(1));
+
+        // 4. Out-of-range request (3 > max_virtqueue_pairs=2) is rejected without touching vrings.
+        assert_eq!(send_mq_cmd(3, &mut avail_idx), VIRTIO_NET_ERR as u8);
+        vring_enable_rx.try_recv().unwrap_err();
+        assert_eq!(net.state().unwrap().curr_queue_pairs, Some(1));
+
+        // 5. Pause disables all vrings; resume re-enables only the active pair (vrings 0, 1).
+        net.pause().unwrap();
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, false), (1, false), (2, false), (3, false)]
+        );
+        net.resume().unwrap();
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, true), (1, true), (2, false), (3, false)]
+        );
+
+        // 6. Reset disables all vrings and resets curr_queue_pairs back to 1.
+        assert_eq!(send_mq_cmd(2, &mut avail_idx), VIRTIO_NET_OK as u8);
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, true), (1, true), (2, true), (3, true)]
+        );
+        net.reset();
+        assert_eq!(
+            recv_four(&vring_enable_rx),
+            vec![(0, false), (1, false), (2, false), (3, false)]
+        );
+        assert_eq!(net.state().unwrap().curr_queue_pairs, Some(1));
+
+        drop(net);
+        backend.join().unwrap();
     }
 }

@@ -271,7 +271,11 @@ fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 }
 
 fn virtio_vhost_net_ctl_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
-    vec![(libc::SYS_timerfd_settime, vec![])]
+    vec![
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_timerfd_settime, vec![]),
+    ]
 }
 
 fn virtio_vhost_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {

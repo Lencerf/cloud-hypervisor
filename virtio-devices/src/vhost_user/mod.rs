@@ -5,7 +5,7 @@ use std::fs::{File, remove_file};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
@@ -308,6 +308,7 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     /// Flag set by the worker when the vhost-user backend is no longer reachable.
     pub disconnected: Arc<AtomicBool>,
     pub resume_evt: EventFd,
+    pub enabled_queues: Option<Arc<AtomicU16>>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -380,6 +381,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             true,
             &self.kill_evt,
             |vhost_user| {
+                vhost_user.set_enabled_queues_tracker(self.enabled_queues.clone());
                 vhost_user.reinitialize_vhost_user(
                     self.mem.memory().deref(),
                     &queues,
@@ -507,6 +509,8 @@ pub struct VhostUserState<C> {
     pub vring_bases: Option<Vec<u64>>,
     #[serde(default)]
     pub backend_state: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curr_queue_pairs: Option<u16>,
 }
 
 impl<C> VhostUserState<C> {
@@ -533,6 +537,7 @@ pub struct VhostUserCommon {
     saved_dirty_log: Option<MemoryRangeTable>,
     dirty_logging: bool,
     resume_evt: Option<EventFd>,
+    pub enabled_queues: Option<Arc<AtomicU16>>,
 }
 
 impl VhostUserCommon {
@@ -551,6 +556,7 @@ impl VhostUserCommon {
             saved_dirty_log: None,
             dirty_logging: false,
             resume_evt: None,
+            enabled_queues: None,
         }
     }
 
@@ -592,8 +598,9 @@ impl VhostUserCommon {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
         let vring_bases = self.vring_bases.take();
-        vu.lock()
-            .unwrap()
+        let mut vu_locked = vu.lock().unwrap();
+        vu_locked.set_enabled_queues_tracker(self.enabled_queues.clone());
+        vu_locked
             .setup_vhost_user(
                 &mem.memory(),
                 &queues,
@@ -604,6 +611,7 @@ impl VhostUserCommon {
                 vring_bases.as_deref(),
             )
             .map_err(ActivateError::VhostUserSetup)?;
+        drop(vu_locked);
 
         let resume_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(ActivateError::CreateEventFd)?;
         self.resume_evt = Some(
@@ -627,6 +635,7 @@ impl VhostUserCommon {
             inflight,
             disconnected: Arc::clone(&self.disconnected),
             resume_evt,
+            enabled_queues: self.enabled_queues.clone(),
         })
     }
 

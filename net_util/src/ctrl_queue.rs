@@ -90,12 +90,15 @@ fn is_tolerated_ctrl_command(ctrl_hdr: ControlHeader) -> bool {
     }
 }
 
+type MqCallback = Box<dyn FnMut(u16) -> bool + Send>;
+
 pub struct CtrlQueue {
     pub taps: Vec<Tap>,
     pub announce_pending: Arc<AtomicBool>,
     pub max_virtqueue_pairs: u16,
     pub curr_queue_pairs: Arc<AtomicU16>,
     pub acked_features: u64,
+    mq_callback: Option<MqCallback>,
 }
 
 impl CtrlQueue {
@@ -112,7 +115,14 @@ impl CtrlQueue {
             max_virtqueue_pairs,
             curr_queue_pairs,
             acked_features,
+            mq_callback: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_mq_callback(mut self, cb: impl FnMut(u16) -> bool + Send + 'static) -> Self {
+        self.mq_callback = Some(Box::new(cb));
+        self
     }
 
     pub fn process<M: GuestMemoryBackend>(
@@ -166,14 +176,17 @@ impl CtrlQueue {
                         false
                     } else {
                         info!("Number of MQ pairs requested: {queue_pairs}");
-                        associate_taps(&self.taps, queue_pairs.into())
-                            .inspect(|()| {
-                                self.curr_queue_pairs.store(queue_pairs, Ordering::Release);
-                            })
+                        let taps_ok = associate_taps(&self.taps, queue_pairs.into())
                             .inspect_err(|e| {
                                 error!("Error setting the number of tap queues: {e:?}");
                             })
-                            .is_ok()
+                            .is_ok();
+                        let ok =
+                            taps_ok && self.mq_callback.as_mut().is_none_or(|cb| cb(queue_pairs));
+                        if ok {
+                            self.curr_queue_pairs.store(queue_pairs, Ordering::Release);
+                        }
+                        ok
                     };
                     (ok, status_desc)
                 }
@@ -445,6 +458,148 @@ mod tests {
         // Such a request must not be acknowledged as successful.
         assert_eq!(run_mq_vq_pairs_set(5, 4), (VIRTIO_NET_ERR as u8, 1));
         assert_eq!(run_mq_vq_pairs_set(0, 4), (VIRTIO_NET_ERR as u8, 1));
+    }
+
+    #[test]
+    fn test_process_mq_vq_pairs_set_invokes_callback_before_ack() {
+        const MEM_SIZE: usize = 0x20_0000;
+        const QSIZE: u16 = 4;
+        const QUEUE_ADDR: u64 = 0x0014_0000;
+        const HEADER_ADDR: u64 = 0x0015_0000;
+        const DATA_ADDR: u64 = 0x0015_1000;
+        const STATUS_ADDR: u64 = 0x0015_2000;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
+        let guest_q = GuestQ::new(GuestAddress(QUEUE_ADDR), &mem, QSIZE);
+        let mut queue = guest_q.create_queue();
+
+        guest_q.dtable[0].set(
+            HEADER_ADDR,
+            size_of::<ControlHeader>() as u32,
+            VRING_DESC_F_NEXT.try_into().unwrap(),
+            1,
+        );
+        guest_q.dtable[1].set(
+            DATA_ADDR,
+            size_of::<u16>() as u32,
+            VRING_DESC_F_NEXT.try_into().unwrap(),
+            2,
+        );
+        guest_q.dtable[2].set(STATUS_ADDR, 1, VRING_DESC_F_WRITE.try_into().unwrap(), 0);
+        guest_q.avail.ring[0].set(0);
+        guest_q.avail.idx.set(1);
+
+        mem.write_obj(
+            ControlHeader {
+                class: VIRTIO_NET_CTRL_MQ as u8,
+                cmd: VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET as u8,
+            },
+            GuestAddress(HEADER_ADDR),
+        )
+        .unwrap();
+        mem.write_obj(3u16, GuestAddress(DATA_ADDR)).unwrap();
+        mem.write_obj(0xff_u8, GuestAddress(STATUS_ADDR)).unwrap();
+
+        let curr_queue_pairs = Arc::new(AtomicU16::new(1));
+        let observed = Arc::new(AtomicU16::new(0));
+        let observed_clone = Arc::clone(&observed);
+        let mem_for_cb = mem.clone();
+
+        let mut ctrl_q = CtrlQueue::new(
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            4,
+            Arc::clone(&curr_queue_pairs),
+            0,
+        )
+        .with_mq_callback(move |pairs| {
+            // Status byte and used ring must not be published before reconfiguration finishes.
+            assert_eq!(
+                mem_for_cb
+                    .read_obj::<u8>(GuestAddress(STATUS_ADDR))
+                    .unwrap(),
+                0xff
+            );
+            observed_clone.store(pairs, Ordering::Release);
+            true
+        });
+
+        ctrl_q.process(&mem, &mut queue, None).unwrap();
+
+        assert_eq!(observed.load(Ordering::Acquire), 3);
+        assert_eq!(curr_queue_pairs.load(Ordering::Acquire), 3);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(STATUS_ADDR)).unwrap(),
+            VIRTIO_NET_OK as u8
+        );
+    }
+
+    #[test]
+    fn test_process_mq_vq_pairs_set_callback_failure_returns_err() {
+        const MEM_SIZE: usize = 0x20_0000;
+        const QSIZE: u16 = 4;
+        const QUEUE_ADDR: u64 = 0x0014_0000;
+        const HEADER_ADDR: u64 = 0x0015_0000;
+        const DATA_ADDR: u64 = 0x0015_1000;
+        const STATUS_ADDR: u64 = 0x0015_2000;
+
+        for (requested, expected_called) in [(2u16, true), (5u16, false)] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
+            let guest_q = GuestQ::new(GuestAddress(QUEUE_ADDR), &mem, QSIZE);
+            let mut queue = guest_q.create_queue();
+
+            guest_q.dtable[0].set(
+                HEADER_ADDR,
+                size_of::<ControlHeader>() as u32,
+                VRING_DESC_F_NEXT.try_into().unwrap(),
+                1,
+            );
+            guest_q.dtable[1].set(
+                DATA_ADDR,
+                size_of::<u16>() as u32,
+                VRING_DESC_F_NEXT.try_into().unwrap(),
+                2,
+            );
+            guest_q.dtable[2].set(STATUS_ADDR, 1, VRING_DESC_F_WRITE.try_into().unwrap(), 0);
+            guest_q.avail.ring[0].set(0);
+            guest_q.avail.idx.set(1);
+
+            mem.write_obj(
+                ControlHeader {
+                    class: VIRTIO_NET_CTRL_MQ as u8,
+                    cmd: VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET as u8,
+                },
+                GuestAddress(HEADER_ADDR),
+            )
+            .unwrap();
+            mem.write_obj(requested, GuestAddress(DATA_ADDR)).unwrap();
+            mem.write_obj(0xff_u8, GuestAddress(STATUS_ADDR)).unwrap();
+
+            let curr_queue_pairs = Arc::new(AtomicU16::new(1));
+            let called = Arc::new(AtomicBool::new(false));
+            let called_clone = Arc::clone(&called);
+
+            let mut ctrl_q = CtrlQueue::new(
+                Vec::new(),
+                Arc::new(AtomicBool::new(false)),
+                4,
+                Arc::clone(&curr_queue_pairs),
+                0,
+            )
+            .with_mq_callback(move |_| {
+                called_clone.store(true, Ordering::Release);
+                false
+            });
+
+            ctrl_q.process(&mem, &mut queue, None).unwrap();
+
+            assert_eq!(called.load(Ordering::Acquire), expected_called);
+            assert_eq!(curr_queue_pairs.load(Ordering::Acquire), 1);
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(STATUS_ADDR)).unwrap(),
+                VIRTIO_NET_ERR as u8
+            );
+        }
     }
 
     #[test]
